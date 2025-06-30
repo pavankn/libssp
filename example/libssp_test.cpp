@@ -4,6 +4,7 @@
 #include <thread>
 
 #include <stdlib.h>
+#include <memory.h>
 #include <iostream>
 #include "imf/net/loop.h"
 #include "imf/net/threadloop.h"
