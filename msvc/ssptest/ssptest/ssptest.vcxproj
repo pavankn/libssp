@@ -102,14 +102,20 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>C:\Users\SANDHU PRODUCTION\source\repos\libssp\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\SANDHU PRODUCTION\source\repos\libssp\include;C:\ffmpeg\include;C:\Program Files\NDI\NDI 6 SDK\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>C:\Users\SANDHU PRODUCTION\source\repos\libssp\lib\win_x64_vs2017;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>libssp.lib;libsspd.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>C:\Users\SANDHU PRODUCTION\source\repos\libssp\lib\win_x64_vs2017;C:\ffmpeg\lib;C:\Program Files\NDI\NDI 6 SDK\Lib\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>libsspd.lib;libssp.lib;avcodec.lib;avformat.lib;avutil.lib;swscale.lib;Processing.NDI.Lib.x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <PostBuildEvent>
+      <Command>copy "C:\ffmpeg\bin\*.dll"  "$(TargetDir)"
+copy "C:\Program Files\NDI\NDI 6 SDK\Bin\x64\Processing.NDI.Lib.x64.dll"  "$(TargetDir)"
+copy "$(SolutionDir)..\..\lib\win_x64_vs2017\*.dll" "$(TargetDir)"
+</Command>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
