@@ -102,7 +102,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>C:\Users\SANDHU PRODUCTION\source\repos\libssp\include;C:\ffmpeg\include;C:\Program Files\NDI\NDI 6 SDK\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\SANDHU PRODUCTION\source\repos\libssp\include;C:\ffmpeg\include;C:\Program Files\NDI\NDI 6 SDK\Include;C:\Users\SANDHU PRODUCTION\source\repos\libssp\include\Khel;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -133,6 +133,16 @@ copy "$(SolutionDir)..\..\lib\win_x64_vs2017\*.dll" "$(TargetDir)"
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\..\..\example\libssp_test.cpp" />
+    <ClCompile Include="..\..\..\src\H264Decoder.cpp" />
+    <ClCompile Include="..\..\..\src\NDISender.cpp" />
+    <ClCompile Include="..\..\..\src\VideoDecoder.cpp" />
+    <ClCompile Include="..\..\..\src\VideoPipeline.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\..\include\Khel\H264Decoder.h" />
+    <ClInclude Include="..\..\..\include\Khel\NDISender.h" />
+    <ClInclude Include="..\..\..\include\Khel\VIdeoDecoder.h" />
+    <ClInclude Include="..\..\..\include\Khel\VIdeoPipeline.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

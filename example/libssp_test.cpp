@@ -26,7 +26,8 @@ extern "C" {
 }
 
 #include <Processing.NDI.Lib.h>
-
+#include "VideoPipeline.h"
+#include "VideoDecoder.h"
 
 static AVCodecContext* codec_ctx_265 = nullptr;
 static const AVCodec* codec_265 = nullptr;
@@ -271,6 +272,41 @@ static void on_disconnect()
 	printf("on disconnect\n");
 }
 
+static void setup(imf::Loop* loop)
+{
+
+	auto client = std::make_unique<imf::SspClient>("192.168.11.108", loop, 0x400000);
+	client->init();
+
+	auto pipeline = std::make_unique<VideoPipeline>(
+		"192.168.11.108",
+		"Camera_1_NDI",
+		VideoDecoder::CodecType::H264);
+
+	if (!pipeline->initialize())
+	{
+		printf("Pipeline failed to initialize\n");
+		return;
+	}
+
+
+	// Wiring callback
+	client->setOnH264DataCallback(
+		[pipelinePtr = pipeline.get()](struct imf::SspH264Data* h264)
+		{
+			pipelinePtr->processPacket(h264->data, h264->len, h264->frm_no);
+		});
+
+	// Other callbacks
+	client->setOnMetaCallback([](auto, auto, auto) {});
+	client->setOnDisconnectedCallback([]() { printf("Disconnected\n"); });
+
+	client->start();
+
+	// If you have multiple pipelines/clients, store them somewhere (e.g., std::vector)
+}
+
+#if 0
 static void setup(imf::Loop *loop)
 {
 	std::string ip = "192.168.11.108";
@@ -297,15 +333,13 @@ static void setup(imf::Loop *loop)
 
 	// add more SspClient if you need
 }
+#endif
 
 int main(int argc, char ** argv)
 {
 	std::unique_ptr<imf::ThreadLoop> threadLooper(new imf::ThreadLoop(std::bind(setup, _1)));
 	threadLooper->start();
 
-	init_264_decoder();
-
-	initialize_decoder_and_ndi(1280, 720, 1280, 720);
 
 	while (1) {
 		std::this_thread::sleep_for(std::chrono::seconds(1));
