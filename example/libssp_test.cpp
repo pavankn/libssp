@@ -11,13 +11,16 @@
 #include <mutex>
 #include <vector>
 #include <string>
-#include "nv12_to_bgra.cuh"
 #include <string>
 #include <thread>
 #include <mutex>
 #include <curl/curl.h>
 #include <algorithm>  // for std::min
 #include <map>
+#include <cuda_runtime.h> // For CUDA API calls
+#include <nppi.h>         // For NPP functions
+#include <nppi_color_conversion.h> // Specific NPP color conversion functions
+#include "nv12_to_bgra.cuh" // Custom header for NV12 to BGRA conversion
 
 using namespace std::placeholders;
 
@@ -26,6 +29,7 @@ using namespace std::placeholders;
 #else
 #pragma comment (lib, "libssp.lib")
 #endif
+
 
 
 extern "C" {
@@ -74,8 +78,44 @@ struct ClientContext {
 
 	// Thread safety
 	std::mutex decoder_mutex;
+
+	// Members for general decode paths, holding CPU-resident data
+	AVFrame* host_frame_bgr = nullptr; // Will hold CPU-resident BGR data after sws_scale
+	SwsContext* sws_ctx_yuv_to_bgr = nullptr; // For YUV to BGR conversion on CPU
+
+
+	// No need for ctx.rgb_frame (AVFrame) or ctx.sws_ctx (SwsContext) for the CUDA path
+	// if you fully offload to GPU. Keep them for SW decode path if still supported.
+
+	// A flag to indicate if CUDA resources are initialized/allocated
+	bool cuda_resources_initialized = false;
 };
 
+
+// Assume imf::SspH264Data and ClientContext, DecoderType enum are defined elsewhere
+// struct imf::SspH264Data { /* ... */ };
+// enum DecoderType { SW, HW_CUDA, /* ... */ };
+
+
+// Helper to check CUDA errors
+#define CHECK_CUDA(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA Error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            /* Handle error, e.g., exit or return */ \
+        } \
+    } while (0)
+
+// Helper to check NPP errors
+#define CHECK_NPP(call) \
+    do { \
+        NppStatus status = call; \
+        if (status != NPP_SUCCESS) { \
+            fprintf(stderr, "NPP Error at %s:%d - %s\n", __FILE__, __LINE__, nppiGetErrorString(status)); \
+            /* Handle error */ \
+        } \
+    } while (0)
 
 
 bool init_decoder(ClientContext& ctx) {
@@ -143,6 +183,190 @@ bool init_decoder(ClientContext& ctx) {
 	return true;
 }
 
+#include <cstdio>
+#include <mutex>
+#include <vector> // Potentially for temporary buffers if needed
+
+
+#if 0
+// --- handle_h264_data function ---
+void handle_h264_data(ClientContext& ctx, struct imf::SspH264Data* h264) {
+	std::lock_guard<std::mutex> lock(ctx.decoder_mutex);
+
+	if (!ctx.codec_ctx) {
+		fprintf(stderr, "Codec context not initialized for client %d\n", ctx.client_id);
+		return;
+	}
+
+	AVPacket* pkt = av_packet_alloc();
+	if (!pkt) {
+		fprintf(stderr, "Failed to allocate AVPacket\n");
+		return;
+	}
+
+	pkt->data = h264->data;
+	pkt->size = h264->len;
+
+	int send_ret = avcodec_send_packet(ctx.codec_ctx, pkt);
+	if (send_ret < 0) {
+		fprintf(stderr, "Error sending packet to decoder: \n");
+		av_packet_free(&pkt);
+		return;
+	}
+
+	AVFrame* frame = av_frame_alloc(); // Frame from decoder (can be HW or SW)
+	if (!frame) {
+		fprintf(stderr, "Failed to allocate AVFrame\n");
+		av_packet_free(&pkt);
+		return;
+	}
+
+	AVFrame* decoded_frame_on_cpu = av_frame_alloc(); // Will hold CPU-accessible data after transfer
+	if (!decoded_frame_on_cpu) {
+		fprintf(stderr, "Failed to allocate decoded_frame_on_cpu\n");
+		av_packet_free(&pkt);
+		av_frame_free(&frame);
+		return;
+	}
+
+	while (true) {
+		int ret = avcodec_receive_frame(ctx.codec_ctx, frame);
+		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+			// No more frames to receive for this packet
+			break;
+		}
+		if (ret < 0) {
+			fprintf(stderr, "Error receiving frame\n");
+			break;
+		}
+
+		printf("Decoded frame %d size %dx%d, format %s\n", h264->frm_no, frame->width, frame->height, av_get_pix_fmt_name((AVPixelFormat)frame->format));
+
+		AVFrame* frame_for_conversion_on_cpu = nullptr;
+
+		// --- Handle Hardware CUDA Decode Path: Transfer GPU frame to CPU ---
+		if (ctx.type == DecoderType::HW_CUDA) {
+			// This step is NECESSARY because bgrToBgra_export expects host pointers.
+			// It copies the GPU-resident frame data to a CPU-resident AVFrame.
+			ret = av_hwframe_transfer_data(decoded_frame_on_cpu, frame, 0);
+			if (ret < 0) {
+				fprintf(stderr, "Error transferring frame data from HW to CPU:\n");
+				av_frame_unref(frame); // Unreference GPU frame
+				continue; // Skip this frame and try next if available
+			}
+			frame_for_conversion_on_cpu = decoded_frame_on_cpu;
+		}
+		else { // --- Software Decode Path: Frame is already on CPU ---
+			frame_for_conversion_on_cpu = frame;
+		}
+
+		// --- Common CPU-based Conversion to BGR using sws_scale ---
+		// This converts the CPU-resident YUV (or other format) frame to CPU-resident BGR.
+		if (!ctx.host_frame_bgr || ctx.last_width != frame_for_conversion_on_cpu->width || ctx.last_height != frame_for_conversion_on_cpu->height) {
+			if (ctx.host_frame_bgr) av_frame_free(&ctx.host_frame_bgr);
+			if (ctx.sws_ctx_yuv_to_bgr) sws_freeContext(ctx.sws_ctx_yuv_to_bgr);
+
+			ctx.host_frame_bgr = av_frame_alloc();
+			if (!ctx.host_frame_bgr) { fprintf(stderr, "Failed to allocate host_frame_bgr\n"); break; }
+
+			ctx.host_frame_bgr->format = AV_PIX_FMT_BGR24; // Intermediate BGR format (on CPU)
+			ctx.host_frame_bgr->width = frame_for_conversion_on_cpu->width;
+			ctx.host_frame_bgr->height = frame_for_conversion_on_cpu->height;
+			// Allocate buffer for the BGR24 frame (on CPU)
+			int buffer_alloc_ret = av_frame_get_buffer(ctx.host_frame_bgr, 32);
+			if (buffer_alloc_ret < 0) {
+				fprintf(stderr, "Failed to allocate buffer for host_frame_bgr:\n");
+				av_frame_free(&ctx.host_frame_bgr); ctx.host_frame_bgr = nullptr;
+				break;
+			}
+
+			ctx.sws_ctx_yuv_to_bgr = sws_getContext(
+				frame_for_conversion_on_cpu->width, frame_for_conversion_on_cpu->height,
+				(AVPixelFormat)frame_for_conversion_on_cpu->format, // Input format
+				ctx.host_frame_bgr->width, ctx.host_frame_bgr->height,
+				AV_PIX_FMT_BGR24, // Output BGR
+				SWS_BILINEAR, nullptr, nullptr, nullptr);
+
+			if (!ctx.sws_ctx_yuv_to_bgr) {
+				printf("sws_getContext failed for client %d\n", ctx.client_id);
+				break;
+			}
+
+			ctx.last_width = frame_for_conversion_on_cpu->width;
+			ctx.last_height = frame_for_conversion_on_cpu->height;
+		}
+
+		// Perform the YUV to BGR conversion on CPU
+		sws_scale(ctx.sws_ctx_yuv_to_bgr,
+			frame_for_conversion_on_cpu->data, frame_for_conversion_on_cpu->linesize,
+			0, frame_for_conversion_on_cpu->height,
+			ctx.host_frame_bgr->data, ctx.host_frame_bgr->linesize);
+
+		// --- Call bgrToBgra_export (from your DLL) with the CPU BGR data ---
+		// This vector will hold the final BGRA data returned to CPU by the DLL
+		std::vector<Npp8u> h_bgra_output(ctx.host_frame_bgr->width * ctx.host_frame_bgr->height * 4);
+		Npp8u alpha_val = 255; // Fully opaque alpha
+
+		int bgrToBgra_status = bgrToBgra_export(
+			(const Npp8u*)ctx.host_frame_bgr->data[0], // Input: CPU BGR data
+			h_bgra_output.data(),                       // Output: CPU BGRA buffer
+			ctx.host_frame_bgr->width,
+			ctx.host_frame_bgr->height,
+			alpha_val
+		);
+
+		if (bgrToBgra_status != 0) {
+			fprintf(stderr, "bgrToBgra_export failed with error code: %d. NDI frame will not be sent.\n", bgrToBgra_status);
+			// Decide how to handle this error: break, continue, log, etc.
+		}
+		else {
+			// --- Send the final host BGRA buffer to NDI ---
+			NDIlib_video_frame_v2_t ndi_frame;
+			ndi_frame.xres = ctx.host_frame_bgr->width;
+			ndi_frame.yres = ctx.host_frame_bgr->height;
+			ndi_frame.FourCC = NDIlib_FourCC_type_BGRA; // NDI understands BGRA
+			ndi_frame.frame_rate_N = 240000; // Example framerate
+			ndi_frame.frame_rate_D = 1001;
+			ndi_frame.picture_aspect_ratio = (float)ndi_frame.xres / ndi_frame.yres;
+			ndi_frame.timecode = NDIlib_send_timecode_synthesize;
+			ndi_frame.p_data = h_bgra_output.data(); // This is a CPU pointer
+			ndi_frame.line_stride_in_bytes = ctx.host_frame_bgr->width * 4; // Width * 4 bytes per pixel
+
+			NDIlib_send_send_video_v2(ctx.ndi_sender, &ndi_frame);
+		}
+
+		av_frame_unref(frame); // Unreference the original decoded frame (GPU or CPU)
+		av_frame_unref(decoded_frame_on_cpu); // Unreference the CPU transferred frame (if HW)
+	}
+
+	// Clean up resources allocated for this packet/frame processing loop
+	av_frame_free(&frame);
+	av_frame_free(&decoded_frame_on_cpu);
+	av_packet_free(&pkt);
+}
+#endif
+
+// Don't forget to add a cleanup function for ClientContext to free CUDA resources
+void cleanup_client_context_cuda(ClientContext& ctx) {
+	/*if (ctx.d_bgra_frame) {
+		CHECK_CUDA(cudaFree(ctx.d_bgra_frame));
+		ctx.d_bgra_frame = nullptr;
+	}*/
+	ctx.cuda_resources_initialized = false;
+	// Also free AVFrame and SwsContext if they are kept for SW path
+	if (ctx.rgb_frame) {
+		av_frame_free(&ctx.rgb_frame);
+		ctx.rgb_frame = nullptr;
+	}
+	if (ctx.sws_ctx) {
+		sws_freeContext(ctx.sws_ctx);
+		ctx.sws_ctx = nullptr;
+	}
+	// Don't free ctx.codec_ctx or ctx.ndi_sender here, as they are managed externally
+}
+
+
+#if 1
 void handle_h264_data(ClientContext& ctx, struct imf::SspH264Data* h264) {
 	std::lock_guard<std::mutex> lock(ctx.decoder_mutex);
 
@@ -231,6 +455,7 @@ void handle_h264_data(ClientContext& ctx, struct imf::SspH264Data* h264) {
 	av_frame_free(&frame);
 	av_packet_free(&pkt);
 }
+#endif
 
 static void on_audio_data_1(struct imf::SspAudioData * audio)
 {
@@ -367,8 +592,8 @@ static void setup(imf::Loop* loop)
 		HWCodecType hwCodecType;
 		std::string ndi_name;
 	} client_inputs[] = {
-		{ "192.168.11.108", DecoderType::SOFTWARE, HWCodecType::H264_CUVID, "Khel_NDI_1" },
-		{ "192.168.11.149", DecoderType::SOFTWARE, HWCodecType::H264_CUVID, "Khel_NDI_2" }
+		{ "192.168.11.108", DecoderType::HW_CUDA, HWCodecType::H264_CUVID, "Khel_NDI_1" },
+		{ "192.168.11.149", DecoderType::HW_CUDA, HWCodecType::H264_CUVID, "Khel_NDI_2" }
 	};
 
 	const int client_count = sizeof(client_inputs) / sizeof(client_inputs[0]);
@@ -461,7 +686,7 @@ int DetectZCam() {
 		ZCamStreamBuilder builder(found[i]);
 		bool success = builder.index("stream0")
 			.resolution(1920, 1080)
-			.bitrate(50000000)
+			.bitrate(10000000)
 			.encoder("h265")
 			.fps(30)
 			.apply();
@@ -481,7 +706,7 @@ int main(int argc, char ** argv)
 {
 	signal(SIGINT, handle_sigint);
 
-	//DetectZCam();
+	DetectZCam();
 
 	std::unique_ptr<imf::ThreadLoop> threadLooper(new imf::ThreadLoop(std::bind(setup, _1)));
 	threadLooper->start();
