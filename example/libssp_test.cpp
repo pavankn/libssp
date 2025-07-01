@@ -29,6 +29,8 @@ extern "C" {
 }
 
 #include <Processing.NDI.Lib.h>
+std::atomic<bool> running(true);
+std::mutex out_mutex;
 
 
 enum class DecoderType {
@@ -104,7 +106,15 @@ bool init_decoder(ClientContext& ctx) {
 			};
 	}
 	else {  // SOFTWARE
+		if (ctx.hwCodecType == HWCodecType::H264_CUVID) {
 		ctx.codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+		}
+		else if (ctx.hwCodecType == HWCodecType::HEVC_CUVID) {
+			ctx.codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+		}else {
+			return false;
+		}
+		
 		if (!ctx.codec) {
 			printf("Client[%d] software decoder not found\n", ctx.client_id);
 			return false;
@@ -118,6 +128,8 @@ bool init_decoder(ClientContext& ctx) {
 		printf("Could not open codec for client %d\n", ctx.client_id);
 		return false;
 	}
+
+	printf("Codec pixel format: %s\n", av_get_pix_fmt_name(ctx.codec_ctx->pix_fmt));
 
 	printf("Client[%d] decoder (%s) initialized.\n", ctx.client_id,
 		(ctx.type == DecoderType::HW_CUDA ? "HW_CUDA" : "SOFTWARE"));
@@ -243,6 +255,102 @@ static void on_disconnect()
 static std::vector<std::unique_ptr<ClientContext>> g_client_contexts;
 static std::vector<std::unique_ptr<imf::SspClient>> g_ssp_clients;
 
+bool is_zcam(const std::string& ip) {
+	std::string url = "http://" + ip + "/info";
+	CURL* curl = curl_easy_init();
+	if (!curl) return false;
+
+	curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 300L);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](char* ptr, size_t size, size_t nmemb, void* userdata) {
+		std::string* response = static_cast<std::string*>(userdata);
+		response->append(ptr, size * nmemb);
+		return size * nmemb;
+		});
+
+	std::string response;
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+	CURLcode res = curl_easy_perform(curl);
+	curl_easy_cleanup(curl);
+
+	if (res == CURLE_OK && response.find("\"model\"") != std::string::npos) {
+		std::lock_guard<std::mutex> lock(out_mutex);
+		std::cout << "Found Z CAM : " << ip << "\n";
+		return true;
+	}
+	return false;
+}
+
+void scan_range(const std::string& base, int start, int end, std::vector<std::string>& cameras) {
+	for (int i = start; i <= end; ++i) {
+		std::string ip = base + std::to_string(i);
+		if (is_zcam(ip)) {
+			std::lock_guard<std::mutex> lock(out_mutex);
+			cameras.push_back(ip);
+		}
+	}
+}
+
+class ZCamStreamBuilder {
+public:
+	ZCamStreamBuilder(const std::string& ip)
+		: ip_(ip) {
+		params_["index"] = "stream1"; // default
+	}
+
+	ZCamStreamBuilder& index(const std::string& index) {
+		params_["index"] = index;
+		return *this;
+	}
+
+	ZCamStreamBuilder& resolution(int w, int h) {
+		params_["width"] = std::to_string(w);
+		params_["height"] = std::to_string(h);
+		return *this;
+	}
+
+	ZCamStreamBuilder& bitrate(int bps) {
+		params_["bitrate"] = std::to_string(bps);
+		return *this;
+	}
+
+	ZCamStreamBuilder& encoder(const std::string& enc) {
+		params_["venc"] = enc;
+		return *this;
+	}
+
+	ZCamStreamBuilder& fps(int value) {
+		params_["fps"] = std::to_string(value);
+		return *this;
+	}
+
+	bool apply() {
+		std::string url = "http://" + ip_ + "/ctrl/stream_setting";
+		bool first = true;
+		for (const auto& pair : params_) {
+			url += (first ? "?" : "&") + pair.first + "=" + pair.second;
+			first = false;
+		}
+
+		CURL* curl = curl_easy_init();
+		if (!curl) return false;
+
+		curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+		curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 500L);
+		CURLcode res = curl_easy_perform(curl);
+		curl_easy_cleanup(curl);
+
+		return res == CURLE_OK;
+	}
+
+
+private:
+	std::string ip_;
+	std::map<std::string, std::string> params_;
+};
+
+
 static void setup(imf::Loop* loop)
 {
 	// Define client inputs (IP + decoder type)
@@ -266,6 +374,7 @@ static void setup(imf::Loop* loop)
 		ctx->client_id = i;
 		ctx->type = input.decoder_type;
 		ctx->name = input.ndi_name;
+		ctx->hwCodecType = input.hwCodecType;
 
 		// Initialize decoder
 		if (!init_decoder(*ctx)) {
@@ -327,9 +436,45 @@ void handle_sigint(int) {
 	running = false;
 }
 
+
+int DetectZCam() {
+	std::vector<std::string> found;
+	std::vector<std::thread> threads;
+	std::string base = "192.168.11."; // Or your subnet
+
+	for (int i = 1; i <= 254; i += 32)
+		threads.emplace_back(scan_range, base, i, ((i + 31) < 254 ? (i + 31) : 254), std::ref(found));
+
+
+	for (auto& t : threads) t.join();
+
+	std::cout << "Z CAMs Found: " << found.size() << std::endl;
+
+	for (int i = 0; i < found.size(); ++i) {
+		ZCamStreamBuilder builder(found[i]);
+		bool success = builder.index("stream0")
+			.resolution(1920, 1080)
+			.bitrate(50000000)
+			.encoder("h265")
+			.fps(30)
+			.apply();
+
+		if (success) {
+			std::cout << "Stream settings applied successfully for: " << found[i] << std::endl;
+		}
+		else {
+			std::cout << "Failed to apply stream settings for: " << found[i] << std::endl;
+		}
+	}
+
+	return 0;
+}
+
 int main(int argc, char ** argv)
 {
 	signal(SIGINT, handle_sigint);
+
+	//DetectZCam();
 
 	std::unique_ptr<imf::ThreadLoop> threadLooper(new imf::ThreadLoop(std::bind(setup, _1)));
 	threadLooper->start();
