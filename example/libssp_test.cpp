@@ -11,6 +11,13 @@
 #include <mutex>
 #include <vector>
 #include <string>
+#include "nv12_to_bgra.cuh"
+#include <string>
+#include <thread>
+#include <mutex>
+#include <curl/curl.h>
+#include <algorithm>  // for std::min
+#include <map>
 
 using namespace std::placeholders;
 
@@ -107,7 +114,7 @@ bool init_decoder(ClientContext& ctx) {
 	}
 	else {  // SOFTWARE
 		if (ctx.hwCodecType == HWCodecType::H264_CUVID) {
-		ctx.codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+			ctx.codec = avcodec_find_decoder(AV_CODEC_ID_H264);
 		}
 		else if (ctx.hwCodecType == HWCodecType::HEVC_CUVID) {
 			ctx.codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
