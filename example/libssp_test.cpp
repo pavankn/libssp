@@ -31,18 +31,14 @@ extern "C" {
 #include <Processing.NDI.Lib.h>
 
 
-static AVCodecContext* codec_ctx_265 = nullptr;
-static const AVCodec* codec_265 = nullptr;
-static AVCodecContext* codec_ctx_264 = nullptr;
-static const AVCodec* codec_264 = nullptr;
-NDIlib_send_instance_t ndi_sender_1;
-NDIlib_send_instance_t ndi_sender_2;
-static SwsContext* sws_ctx_1 = nullptr;
-static SwsContext* sws_ctx_2 = nullptr;
-
 enum class DecoderType {
 	SOFTWARE,
 	HW_CUDA
+};
+
+enum class HWCodecType {
+	H264_CUVID,
+	HEVC_CUVID
 };
 
 struct ClientContext {
@@ -50,7 +46,7 @@ struct ClientContext {
 	std::string name;                    // NDI sender name
 
 	DecoderType type = DecoderType::SOFTWARE;
-
+	HWCodecType hwCodecType = HWCodecType::H264_CUVID;
 	// FFmpeg decoding
 	const AVCodec* codec = nullptr;
 	AVCodecContext* codec_ctx = nullptr;
@@ -74,8 +70,16 @@ struct ClientContext {
 
 
 bool init_decoder(ClientContext& ctx) {
+	std::string decoderName;
 	if (ctx.type == DecoderType::HW_CUDA) {
-		ctx.codec = avcodec_find_decoder_by_name("h264_cuvid");  // or "h264_nvdec"
+		if (ctx.hwCodecType == HWCodecType::H264_CUVID) {
+			decoderName = "h264_cuvid";
+		}else if (ctx.hwCodecType == HWCodecType::HEVC_CUVID) {
+			decoderName = "hevc_cuvid";
+		}else {
+			return false;
+		}
+		ctx.codec = avcodec_find_decoder_by_name(decoderName.c_str());  // or "h264_nvdec"
 		if (!ctx.codec) {
 			printf("Client[%d] CUDA decoder not found\n", ctx.client_id);
 			return false;
@@ -173,6 +177,11 @@ void handle_h264_data(ClientContext& ctx, struct imf::SspH264Data* h264) {
 				ctx.rgb_frame->width, ctx.rgb_frame->height,
 				AV_PIX_FMT_BGRA, SWS_BILINEAR, nullptr, nullptr, nullptr);
 
+			if (!ctx.sws_ctx) {
+				printf("sws_getContext failed for client %d\n", ctx.client_id);
+				break;
+			}
+
 			ctx.last_width = use_frame->width;
 			ctx.last_height = use_frame->height;
 		}
@@ -240,10 +249,11 @@ static void setup(imf::Loop* loop)
 	struct {
 		std::string ip;
 		DecoderType decoder_type;
+		HWCodecType hwCodecType;
 		std::string ndi_name;
 	} client_inputs[] = {
-		{ "192.168.11.108", DecoderType::HW_CUDA, "Khel_NDI_1" },
-		{ "192.168.11.149", DecoderType::HW_CUDA, "Khel_NDI_2" }
+		{ "192.168.11.108", DecoderType::SOFTWARE, HWCodecType::H264_CUVID, "Khel_NDI_1" },
+		{ "192.168.11.149", DecoderType::SOFTWARE, HWCodecType::H264_CUVID, "Khel_NDI_2" }
 	};
 
 	const int client_count = sizeof(client_inputs) / sizeof(client_inputs[0]);
@@ -313,8 +323,14 @@ void cleanup_clients() {
 	g_ssp_clients.clear();
 }
 
+void handle_sigint(int) {
+	running = false;
+}
+
 int main(int argc, char ** argv)
 {
+	signal(SIGINT, handle_sigint);
+
 	std::unique_ptr<imf::ThreadLoop> threadLooper(new imf::ThreadLoop(std::bind(setup, _1)));
 	threadLooper->start();
 
@@ -323,6 +339,7 @@ int main(int argc, char ** argv)
 		std::this_thread::sleep_for(std::chrono::seconds(1));
 	}
 
+	cleanup_clients();
 	threadLooper->stop();
 	return 0;
 }
