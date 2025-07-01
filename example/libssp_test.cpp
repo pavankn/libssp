@@ -29,6 +29,7 @@ extern "C" {
 }
 
 #include <Processing.NDI.Lib.h>
+std::atomic<bool> running(true);
 
 
 enum class DecoderType {
