@@ -11,9 +11,6 @@
 #include <mutex>
 #include <vector>
 #include <string>
-#include <string>
-#include <thread>
-#include <mutex>
 #include <curl/curl.h>
 #include <algorithm>  // for std::min
 #include <map>
@@ -21,6 +18,8 @@
 #include <nppi.h>         // For NPP functions
 #include <nppi_color_conversion.h> // Specific NPP color conversion functions
 #include "nv12_to_bgra.cuh" // Custom header for NV12 to BGRA conversion
+#include <nlohmann/json.hpp>
+#include <queue>
 
 using namespace std::placeholders;
 
@@ -30,6 +29,7 @@ using namespace std::placeholders;
 #pragma comment (lib, "libssp.lib")
 #endif
 
+using json = nlohmann::json;
 
 
 extern "C" {
@@ -54,6 +54,7 @@ enum class HWCodecType {
 	HEVC_CUVID
 };
 
+#if 0
 struct ClientContext {
 	int client_id;                        // Unique ID per client
 	std::string name;                    // NDI sender name
@@ -90,6 +91,45 @@ struct ClientContext {
 	// A flag to indicate if CUDA resources are initialized/allocated
 	bool cuda_resources_initialized = false;
 };
+#else
+
+struct ClientContext {
+	int client_id = -1;
+
+	// Decoder config
+	DecoderType type = DecoderType::SOFTWARE;
+	HWCodecType hwCodecType = HWCodecType::H264_CUVID;
+
+	const AVCodec* codec = nullptr;
+	AVCodecContext* codec_ctx = nullptr;
+	AVBufferRef* hw_device_ctx = nullptr;
+	std::string name;  // NDI sender name
+
+	// Output frame conversion
+	SwsContext* sws_ctx = nullptr;
+	AVFrame* rgb_frame = nullptr;
+	int last_width = 0;
+	int last_height = 0;
+
+	// NDI
+	NDIlib_send_instance_t ndi_sender = nullptr;
+
+	// Mutex for decoder
+	std::mutex decoder_mutex;
+
+	// Threading for NDI
+	std::thread ndi_thread;
+	std::mutex rgb_mutex;
+	std::condition_variable rgb_cv;
+	std::atomic<bool> new_rgb_ready{ false };
+	std::atomic<bool> shutdown{ false };
+
+	std::queue<AVFrame*> frame_queue;
+	std::mutex queue_mutex;
+	std::condition_variable queue_cv;
+	bool running = true; // for clean exit
+};
+#endif
 
 
 // Assume imf::SspH264Data and ClientContext, DecoderType enum are defined elsewhere
@@ -183,176 +223,13 @@ bool init_decoder(ClientContext& ctx) {
 	return true;
 }
 
-#include <cstdio>
-#include <mutex>
-#include <vector> // Potentially for temporary buffers if needed
-
-
-#if 0
-// --- handle_h264_data function ---
-void handle_h264_data(ClientContext& ctx, struct imf::SspH264Data* h264) {
-	std::lock_guard<std::mutex> lock(ctx.decoder_mutex);
-
-	if (!ctx.codec_ctx) {
-		fprintf(stderr, "Codec context not initialized for client %d\n", ctx.client_id);
-		return;
-	}
-
-	AVPacket* pkt = av_packet_alloc();
-	if (!pkt) {
-		fprintf(stderr, "Failed to allocate AVPacket\n");
-		return;
-	}
-
-	pkt->data = h264->data;
-	pkt->size = h264->len;
-
-	int send_ret = avcodec_send_packet(ctx.codec_ctx, pkt);
-	if (send_ret < 0) {
-		fprintf(stderr, "Error sending packet to decoder: \n");
-		av_packet_free(&pkt);
-		return;
-	}
-
-	AVFrame* frame = av_frame_alloc(); // Frame from decoder (can be HW or SW)
-	if (!frame) {
-		fprintf(stderr, "Failed to allocate AVFrame\n");
-		av_packet_free(&pkt);
-		return;
-	}
-
-	AVFrame* decoded_frame_on_cpu = av_frame_alloc(); // Will hold CPU-accessible data after transfer
-	if (!decoded_frame_on_cpu) {
-		fprintf(stderr, "Failed to allocate decoded_frame_on_cpu\n");
-		av_packet_free(&pkt);
-		av_frame_free(&frame);
-		return;
-	}
-
-	while (true) {
-		int ret = avcodec_receive_frame(ctx.codec_ctx, frame);
-		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-			// No more frames to receive for this packet
-			break;
-		}
-		if (ret < 0) {
-			fprintf(stderr, "Error receiving frame\n");
-			break;
-		}
-
-		printf("Decoded frame %d size %dx%d, format %s\n", h264->frm_no, frame->width, frame->height, av_get_pix_fmt_name((AVPixelFormat)frame->format));
-
-		AVFrame* frame_for_conversion_on_cpu = nullptr;
-
-		// --- Handle Hardware CUDA Decode Path: Transfer GPU frame to CPU ---
-		if (ctx.type == DecoderType::HW_CUDA) {
-			// This step is NECESSARY because bgrToBgra_export expects host pointers.
-			// It copies the GPU-resident frame data to a CPU-resident AVFrame.
-			ret = av_hwframe_transfer_data(decoded_frame_on_cpu, frame, 0);
-			if (ret < 0) {
-				fprintf(stderr, "Error transferring frame data from HW to CPU:\n");
-				av_frame_unref(frame); // Unreference GPU frame
-				continue; // Skip this frame and try next if available
-			}
-			frame_for_conversion_on_cpu = decoded_frame_on_cpu;
-		}
-		else { // --- Software Decode Path: Frame is already on CPU ---
-			frame_for_conversion_on_cpu = frame;
-		}
-
-		// --- Common CPU-based Conversion to BGR using sws_scale ---
-		// This converts the CPU-resident YUV (or other format) frame to CPU-resident BGR.
-		if (!ctx.host_frame_bgr || ctx.last_width != frame_for_conversion_on_cpu->width || ctx.last_height != frame_for_conversion_on_cpu->height) {
-			if (ctx.host_frame_bgr) av_frame_free(&ctx.host_frame_bgr);
-			if (ctx.sws_ctx_yuv_to_bgr) sws_freeContext(ctx.sws_ctx_yuv_to_bgr);
-
-			ctx.host_frame_bgr = av_frame_alloc();
-			if (!ctx.host_frame_bgr) { fprintf(stderr, "Failed to allocate host_frame_bgr\n"); break; }
-
-			ctx.host_frame_bgr->format = AV_PIX_FMT_BGR24; // Intermediate BGR format (on CPU)
-			ctx.host_frame_bgr->width = frame_for_conversion_on_cpu->width;
-			ctx.host_frame_bgr->height = frame_for_conversion_on_cpu->height;
-			// Allocate buffer for the BGR24 frame (on CPU)
-			int buffer_alloc_ret = av_frame_get_buffer(ctx.host_frame_bgr, 32);
-			if (buffer_alloc_ret < 0) {
-				fprintf(stderr, "Failed to allocate buffer for host_frame_bgr:\n");
-				av_frame_free(&ctx.host_frame_bgr); ctx.host_frame_bgr = nullptr;
-				break;
-			}
-
-			ctx.sws_ctx_yuv_to_bgr = sws_getContext(
-				frame_for_conversion_on_cpu->width, frame_for_conversion_on_cpu->height,
-				(AVPixelFormat)frame_for_conversion_on_cpu->format, // Input format
-				ctx.host_frame_bgr->width, ctx.host_frame_bgr->height,
-				AV_PIX_FMT_BGR24, // Output BGR
-				SWS_BILINEAR, nullptr, nullptr, nullptr);
-
-			if (!ctx.sws_ctx_yuv_to_bgr) {
-				printf("sws_getContext failed for client %d\n", ctx.client_id);
-				break;
-			}
-
-			ctx.last_width = frame_for_conversion_on_cpu->width;
-			ctx.last_height = frame_for_conversion_on_cpu->height;
-		}
-
-		// Perform the YUV to BGR conversion on CPU
-		sws_scale(ctx.sws_ctx_yuv_to_bgr,
-			frame_for_conversion_on_cpu->data, frame_for_conversion_on_cpu->linesize,
-			0, frame_for_conversion_on_cpu->height,
-			ctx.host_frame_bgr->data, ctx.host_frame_bgr->linesize);
-
-		// --- Call bgrToBgra_export (from your DLL) with the CPU BGR data ---
-		// This vector will hold the final BGRA data returned to CPU by the DLL
-		std::vector<Npp8u> h_bgra_output(ctx.host_frame_bgr->width * ctx.host_frame_bgr->height * 4);
-		Npp8u alpha_val = 255; // Fully opaque alpha
-
-		int bgrToBgra_status = bgrToBgra_export(
-			(const Npp8u*)ctx.host_frame_bgr->data[0], // Input: CPU BGR data
-			h_bgra_output.data(),                       // Output: CPU BGRA buffer
-			ctx.host_frame_bgr->width,
-			ctx.host_frame_bgr->height,
-			alpha_val
-		);
-
-		if (bgrToBgra_status != 0) {
-			fprintf(stderr, "bgrToBgra_export failed with error code: %d. NDI frame will not be sent.\n", bgrToBgra_status);
-			// Decide how to handle this error: break, continue, log, etc.
-		}
-		else {
-			// --- Send the final host BGRA buffer to NDI ---
-			NDIlib_video_frame_v2_t ndi_frame;
-			ndi_frame.xres = ctx.host_frame_bgr->width;
-			ndi_frame.yres = ctx.host_frame_bgr->height;
-			ndi_frame.FourCC = NDIlib_FourCC_type_BGRA; // NDI understands BGRA
-			ndi_frame.frame_rate_N = 240000; // Example framerate
-			ndi_frame.frame_rate_D = 1001;
-			ndi_frame.picture_aspect_ratio = (float)ndi_frame.xres / ndi_frame.yres;
-			ndi_frame.timecode = NDIlib_send_timecode_synthesize;
-			ndi_frame.p_data = h_bgra_output.data(); // This is a CPU pointer
-			ndi_frame.line_stride_in_bytes = ctx.host_frame_bgr->width * 4; // Width * 4 bytes per pixel
-
-			NDIlib_send_send_video_v2(ctx.ndi_sender, &ndi_frame);
-		}
-
-		av_frame_unref(frame); // Unreference the original decoded frame (GPU or CPU)
-		av_frame_unref(decoded_frame_on_cpu); // Unreference the CPU transferred frame (if HW)
-	}
-
-	// Clean up resources allocated for this packet/frame processing loop
-	av_frame_free(&frame);
-	av_frame_free(&decoded_frame_on_cpu);
-	av_packet_free(&pkt);
-}
-#endif
-
 // Don't forget to add a cleanup function for ClientContext to free CUDA resources
 void cleanup_client_context_cuda(ClientContext& ctx) {
 	/*if (ctx.d_bgra_frame) {
 		CHECK_CUDA(cudaFree(ctx.d_bgra_frame));
 		ctx.d_bgra_frame = nullptr;
 	}*/
-	ctx.cuda_resources_initialized = false;
+	//ctx.cuda_resources_initialized = false;
 	// Also free AVFrame and SwsContext if they are kept for SW path
 	if (ctx.rgb_frame) {
 		av_frame_free(&ctx.rgb_frame);
@@ -366,9 +243,49 @@ void cleanup_client_context_cuda(ClientContext& ctx) {
 }
 
 
+void send_to_ndi(ClientContext* ctx, AVFrame* frame) {
+	if (!ctx || !frame) return;
+
+	NDIlib_video_frame_v2_t ndi_frame = {};
+	ndi_frame.xres = frame->width;
+	ndi_frame.yres = frame->height;
+	ndi_frame.FourCC = NDIlib_FourCC_type_BGRA;
+	ndi_frame.frame_rate_N = 240000;
+	ndi_frame.frame_rate_D = 1001;
+	ndi_frame.picture_aspect_ratio = (float)frame->width / frame->height;
+	ndi_frame.timecode = NDIlib_send_timecode_synthesize;
+	ndi_frame.p_data = frame->data[0];
+	ndi_frame.line_stride_in_bytes = frame->linesize[0];
+
+	NDIlib_send_send_video_v2(ctx->ndi_sender, &ndi_frame);
+}
+
+
+void ndi_sender_thread(ClientContext* ctx) {
+	while (ctx->running) {
+		std::unique_lock<std::mutex> lock(ctx->queue_mutex);
+		ctx->queue_cv.wait(lock, [&] {
+			return !ctx->frame_queue.empty() || !ctx->running;
+			});
+
+		while (!ctx->frame_queue.empty()) {
+			AVFrame* frame = ctx->frame_queue.front();
+			ctx->frame_queue.pop();
+			lock.unlock(); // unlock early
+
+			printf("[NDI %d] Sending frame to NDI...\n", ctx->client_id);
+
+			send_to_ndi(ctx, frame);  // Use the frame popped from queue
+
+			av_frame_free(&frame);
+			lock.lock();
+		}
+	}
+}
+
 #if 1
 void handle_h264_data(ClientContext& ctx, struct imf::SspH264Data* h264) {
-	std::lock_guard<std::mutex> lock(ctx.decoder_mutex);
+	std::lock_guard<std::mutex> decoder_lock(ctx.decoder_mutex);
 
 	if (!ctx.codec_ctx) return;
 
@@ -412,7 +329,13 @@ void handle_h264_data(ClientContext& ctx, struct imf::SspH264Data* h264) {
 			ctx.rgb_frame->format = AV_PIX_FMT_BGRA;
 			ctx.rgb_frame->width = use_frame->width;
 			ctx.rgb_frame->height = use_frame->height;
-			av_frame_get_buffer(ctx.rgb_frame, 32);
+
+			if (av_frame_get_buffer(ctx.rgb_frame, 32) < 0) {
+				fprintf(stderr, "Failed to allocate buffer for RGB frame\n");
+				av_frame_free(&ctx.rgb_frame);
+				break;
+			}
+
 
 			ctx.sws_ctx = sws_getContext(
 				use_frame->width, use_frame->height,
@@ -434,18 +357,25 @@ void handle_h264_data(ClientContext& ctx, struct imf::SspH264Data* h264) {
 			0, use_frame->height,
 			ctx.rgb_frame->data, ctx.rgb_frame->linesize);
 
-		NDIlib_video_frame_v2_t ndi_frame;
-		ndi_frame.xres = ctx.rgb_frame->width;
-		ndi_frame.yres = ctx.rgb_frame->height;
-		ndi_frame.FourCC = NDIlib_FourCC_type_BGRA;
-		ndi_frame.frame_rate_N = 240000;
-		ndi_frame.frame_rate_D = 1001;
-		ndi_frame.picture_aspect_ratio = (float)ctx.rgb_frame->width / ctx.rgb_frame->height;
-		ndi_frame.timecode = NDIlib_send_timecode_synthesize;
-		ndi_frame.p_data = ctx.rgb_frame->data[0];
-		ndi_frame.line_stride_in_bytes = ctx.rgb_frame->linesize[0];
+		printf("[Decoder %d] Queuing frame for NDI\n", ctx.client_id);
 
-		NDIlib_send_send_video_v2(ctx.ndi_sender, &ndi_frame);
+		AVFrame* queued_frame = av_frame_alloc();
+		if (av_frame_ref(queued_frame, ctx.rgb_frame) < 0) {
+			fprintf(stderr, "Failed to copy frame for queue\n");
+			av_frame_free(&queued_frame);
+			break;
+		}
+
+		{
+			std::lock_guard<std::mutex> qlock(ctx.queue_mutex);
+			ctx.frame_queue.push(queued_frame);
+			printf("[Decoder %d] Queue size: %zu\n", ctx.client_id, ctx.frame_queue.size());
+		}
+		ctx.queue_cv.notify_one();
+
+		/*std::lock_guard<std::mutex> rgb_lock(ctx.rgb_mutex);
+		ctx.new_rgb_ready = true;
+		ctx.rgb_cv.notify_one();*/
 
 		av_frame_unref(frame);
 		if (hw_frame) av_frame_unref(hw_frame);
@@ -524,15 +454,16 @@ void scan_range(const std::string& base, int start, int end, std::vector<std::st
 	}
 }
 
+
 class ZCamStreamBuilder {
 public:
 	ZCamStreamBuilder(const std::string& ip)
 		: ip_(ip) {
-		params_["index"] = "stream1"; // default
+		params_["send_stream"] = "Stream0"; // default
 	}
 
 	ZCamStreamBuilder& index(const std::string& index) {
-		params_["index"] = index;
+		params_["send_stream"] = index;
 		return *this;
 	}
 
@@ -558,28 +489,54 @@ public:
 	}
 
 	bool apply() {
-		std::string url = "http://" + ip_ + "/ctrl/stream_setting";
-		bool first = true;
-		for (const auto& pair : params_) {
-			url += (first ? "?" : "&") + pair.first + "=" + pair.second;
-			first = false;
-		}
-
 		CURL* curl = curl_easy_init();
 		if (!curl) return false;
 
+		std::string url = "http://" + ip_ + "/ctrl/set?";
+		bool first = true;
+
+		for (const auto& pair : params_) {
+			if (!first) url += "&";
+			char* key = curl_easy_escape(curl, pair.first.c_str(), 0);
+			char* value = curl_easy_escape(curl, pair.second.c_str(), 0);
+			url += std::string(key) + "=" + value;
+			curl_free(key);
+			curl_free(value);
+			first = false;
+		}
+
+		std::string response_data;
 		curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
 		curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 500L);
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
+
 		CURLcode res = curl_easy_perform(curl);
 		curl_easy_cleanup(curl);
 
-		return res == CURLE_OK;
-	}
+		if (res != CURLE_OK) {
+			fprintf(stderr, "CURL error: %s\n", curl_easy_strerror(res));
+			return false;
+		}
 
+		try {
+			auto j = json::parse(response_data);
+			return j.contains("code") && j["code"] == 0;
+		}
+		catch (const std::exception& e) {
+			fprintf(stderr, "JSON parse error: %s\n", e.what());
+			return false;
+		}
+	}
 
 private:
 	std::string ip_;
 	std::map<std::string, std::string> params_;
+
+	static size_t write_callback(void* contents, size_t size, size_t nmemb, void* userp) {
+		((std::string*)userp)->append((char*)contents, size * nmemb);
+		return size * nmemb;
+	}
 };
 
 
@@ -592,8 +549,8 @@ static void setup(imf::Loop* loop)
 		HWCodecType hwCodecType;
 		std::string ndi_name;
 	} client_inputs[] = {
-		{ "192.168.11.108", DecoderType::HW_CUDA, HWCodecType::H264_CUVID, "Khel_NDI_1" },
-		{ "192.168.11.149", DecoderType::HW_CUDA, HWCodecType::H264_CUVID, "Khel_NDI_2" }
+		//{ "192.168.11.108", DecoderType::HW_CUDA, HWCodecType::HEVC_CUVID, "Khel_NDI_1" },
+		{ "192.168.11.149", DecoderType::SOFTWARE, HWCodecType::HEVC_CUVID, "Khel_NDI_2" }
 	};
 
 	const int client_count = sizeof(client_inputs) / sizeof(client_inputs[0]);
@@ -622,6 +579,8 @@ static void setup(imf::Loop* loop)
 			printf("Failed to create NDI sender for client %d\n", i);
 			continue;
 		}
+		ctx->ndi_thread = std::thread(ndi_sender_thread, ctx.get());
+
 
 		// Save context pointer for lambda
 		ClientContext* ctx_ptr = ctx.get();
@@ -649,17 +608,29 @@ static void setup(imf::Loop* loop)
 
 void cleanup_clients() {
 	for (auto& ctx : g_client_contexts) {
-		if (ctx->ndi_sender)
+		ctx->running = false;
+		ctx->queue_cv.notify_all();
+		if (ctx->ndi_thread.joinable()) {
+			ctx->ndi_thread.join();
+		}
+
+		if (ctx->ndi_sender) {
 			NDIlib_send_destroy(ctx->ndi_sender);
-		if (ctx->codec_ctx)
+		}
+		if (ctx->codec_ctx) {
 			avcodec_free_context(&ctx->codec_ctx);
-		if (ctx->hw_device_ctx)
+		}
+		if (ctx->hw_device_ctx) {
 			av_buffer_unref(&ctx->hw_device_ctx);
-		if (ctx->sws_ctx)
+		}
+		if (ctx->sws_ctx) {
 			sws_freeContext(ctx->sws_ctx);
-		if (ctx->rgb_frame)
+		}
+		if (ctx->rgb_frame) {
 			av_frame_free(&ctx->rgb_frame);
-	}
+		}
+	}	
+
 	g_client_contexts.clear();
 	g_ssp_clients.clear();
 }
@@ -684,7 +655,7 @@ int DetectZCam() {
 
 	for (int i = 0; i < found.size(); ++i) {
 		ZCamStreamBuilder builder(found[i]);
-		bool success = builder.index("stream0")
+		bool success = builder.index("Stream0")
 			.resolution(1920, 1080)
 			.bitrate(10000000)
 			.encoder("h265")
