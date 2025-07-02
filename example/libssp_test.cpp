@@ -14,7 +14,7 @@
 #include <nlohmann/json.hpp>
 #include <curl/curl.h>
 #include <queue>
-#include <thread>
+#include "nv12_to_bgra.cuh"
 
 using namespace std::placeholders;
 using json = nlohmann::json;
@@ -32,7 +32,22 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 #include <libavcodec/bsf.h>
+#include <libavutil/error.h> // For av_err2str
 }
+
+// fix temporary array error in c++1x
+#ifdef av_err2str
+#undef av_err2str
+av_always_inline char* av_err2str(int errnum)
+{
+	// static char str[AV_ERROR_MAX_STRING_SIZE];
+	// thread_local may be better than static in multi-thread circumstance
+	thread_local char str[AV_ERROR_MAX_STRING_SIZE];
+	memset(str, 0, sizeof(str));
+	return av_make_error_string(str, AV_ERROR_MAX_STRING_SIZE, errnum);
+}
+#endif
+
 
 #include <Processing.NDI.Lib.h>
 std::atomic<bool> running(true);
@@ -213,10 +228,9 @@ int DetectZCam() {
 	std::cout << "Z CAMs Found: " << found.size() << std::endl;
 	for (int i = 0; i < found.size(); ++i) {
 		ZCamStreamBuilder builder(found[i]);
-		bool success = builder.index("Stream1")
-			.resolution(1280, 720)
-			.encoder("h264")
+		bool success = builder.index("Stream0")			
 			.fps(30)
+			.bitrate(10000000)
 			.apply();
 		if (success) {
 			std::cout << "Stream settings applied successfully for: " << found[i] << std::endl;
@@ -283,8 +297,9 @@ bool init_decoder(ClientContext& ctx) {
 
 	printf("before avcodec_open2");
 
-	if (avcodec_open2(ctx.codec_ctx, ctx.codec, nullptr) < 0) {
-		printf("Could not open codec for client %d\n", ctx.client_id);
+	int ret = avcodec_open2(ctx.codec_ctx, ctx.codec, nullptr);
+	if (ret < 0) {
+		printf("Client[%d] Could not open codec: %s\n", ctx.client_id, av_err2str(ret));
 		return false;
 	}
 
@@ -293,37 +308,11 @@ bool init_decoder(ClientContext& ctx) {
 	return true;
 }
 
-bool is_hevc_keyframe(const uint8_t* data, size_t size) {
-	if (!data || size < 6) return false;
-
-	// Skip start code if present
-	int offset = 0;
-	if (data[0] == 0x00 && data[1] == 0x00) {
-		if (data[2] == 0x01) offset = 3;
-		else if (data[2] == 0x00 && data[3] == 0x01) offset = 4;
-	}
-
-	if (size < offset + 2) return false;
-
-	const uint8_t* nal = data + offset;
-	uint8_t nal_unit_type = (nal[0] >> 1) & 0x3F;
-
-	// HEVC keyframe NAL unit types: IDR_W_RADL (19), IDR_N_LP (20), CRA_NUT (21)
-	return (nal_unit_type == 19 || nal_unit_type == 20 || nal_unit_type == 21);
-}
-
 void handle_h264_data(ClientContext& ctx, struct imf::SspH264Data* h264) {
 	if (!h264 || !h264->data || h264->len == 0) {
 		printf("[Decoder %d] Invalid H264 data received\n", ctx.client_id);
 		return;
 	}
-
-
-	const uint8_t start_code[] = { 0x00, 0x00, 0x00, 0x01 };
-	bool has_start_code = (h264->len >= 4) &&
-		(h264->data[0] == 0x00 && h264->data[1] == 0x00 &&
-			((h264->data[2] == 0x00 && h264->data[3] == 0x01) ||
-				(h264->data[2] == 0x01)));
 
 	AVPacket* pkt = av_packet_alloc();
 	if (!pkt) {
@@ -335,39 +324,11 @@ void handle_h264_data(ClientContext& ctx, struct imf::SspH264Data* h264) {
 	pkt->pts = h264->pts;
 	pkt->flags = (h264->type == 0) ? AV_PKT_FLAG_KEY : 0; // 0 for I-frame, non-zero for P-frame
 
-	if (ctx.packet_queue.size() > MAX_QUEUE_SIZE * 0.9 && !is_hevc_keyframe(h264->data, h264->len)) {
-		av_packet_free(&pkt);
-		printf("[Decoder %d] Dropped P-frame due to high load\n", ctx.client_id);
-		return;
-	}
+	pkt->data = (uint8_t*)av_memdup(h264->data, h264->len);
+	pkt->size = (int)h264->len;	
 
-
-	if (has_start_code) {
-		pkt->data = (uint8_t*)av_memdup(h264->data, h264->len);
-		pkt->size = (int)h264->len;
-	}
-	else {
-		pkt->size = (int)(sizeof(start_code) + h264->len);
-		pkt->data = (uint8_t*)av_malloc(pkt->size);
-		if (!pkt->data) {
-			printf("[Decoder %d] Memory allocation failed\n", ctx.client_id);
-			av_packet_free(&pkt);
-			return;
-		}
-		memcpy(pkt->data, start_code, sizeof(start_code));
-		memcpy(pkt->data + sizeof(start_code), h264->data, h264->len);
-	}
-
-	// Drop if queue is full
-	{
-		std::lock_guard<std::mutex> lock(ctx.packet_queue_mutex);
-		if (ctx.packet_queue.size() >= MAX_QUEUE_SIZE) {
-			printf("[Decoder %d] Packet queue full, dropping\n", ctx.client_id);
-			av_packet_free(&pkt);
-			return;
-		}
-		ctx.packet_queue.push(pkt);
-	}
+	std::lock_guard<std::mutex> lock(ctx.packet_queue_mutex);
+	ctx.packet_queue.push(pkt);
 
 	ctx.packet_queue_cv.notify_one();
 }
@@ -378,7 +339,7 @@ void send_to_ndi(ClientContext* ctx, AVFrame* frame) {
 	ndi_frame.xres = frame->width;
 	ndi_frame.yres = frame->height;
 	ndi_frame.FourCC = NDIlib_FourCC_type_BGRA;
-	ndi_frame.frame_rate_N = 30000;
+	ndi_frame.frame_rate_N = 240000;
 	ndi_frame.frame_rate_D = 1001;
 	ndi_frame.picture_aspect_ratio = (float)frame->width / frame->height;
 	ndi_frame.timecode = NDIlib_send_timecode_synthesize;
@@ -430,12 +391,12 @@ void decode_thread_func(ClientContext* ctx)
 			av_packet_free(&pkt);
 			continue;
 		}
-
-		if (avcodec_send_packet(ctx->codec_ctx, pkt) < 0) {
-			printf("[Decoder %d] Failed to send packet\n", ctx->client_id);
+		int ret = avcodec_send_packet(ctx->codec_ctx, pkt);
+		if (ret < 0) {
+			printf("[Decoder %d] Failed to send packet : %s\n", ctx->client_id, av_err2str(ret));
 			av_packet_free(&pkt);
 			continue;
-		}
+		}		
 
 		AVFrame* frame = av_frame_alloc();
 		AVFrame* hw_frame = nullptr;
@@ -454,33 +415,28 @@ void decode_thread_func(ClientContext* ctx)
 
 			// If hardware decode, transfer to system memory
 			if (ctx->type == DecoderType::HW_CUDA) {
-				if (!hw_frame) hw_frame = av_frame_alloc();
-				if (av_hwframe_transfer_data(hw_frame, frame, 0) < 0) {
-					printf("Failed to transfer HW frame to CPU\n");
+				if (!hw_frame) {
+					hw_frame = av_frame_alloc();
+				}
+				ret = av_hwframe_transfer_data(hw_frame, frame, 0);
+				if (ret < 0) {
+					printf("Failed to transfer HW frame to CPU: %s\n", av_err2str(ret));
 					break;
 				}
 				use_frame = hw_frame;
 			}
 
-			// Prepare or reallocate RGB frame
+			// Prepare or reallocate BGRA frame if resolution changed
 			if (!ctx->rgb_frame || ctx->last_width != use_frame->width || ctx->last_height != use_frame->height) {
 				if (ctx->rgb_frame) av_frame_free(&ctx->rgb_frame);
-				if (ctx->sws_ctx) sws_freeContext(ctx->sws_ctx);
 
 				ctx->rgb_frame = av_frame_alloc();
 				ctx->rgb_frame->format = AV_PIX_FMT_BGRA;
 				ctx->rgb_frame->width = use_frame->width;
 				ctx->rgb_frame->height = use_frame->height;
-				av_frame_get_buffer(ctx->rgb_frame, 32);
 
-				ctx->sws_ctx = sws_getContext(
-					use_frame->width, use_frame->height,
-					(AVPixelFormat)use_frame->format,
-					ctx->rgb_frame->width, ctx->rgb_frame->height,
-					AV_PIX_FMT_BGRA, SWS_BILINEAR, nullptr, nullptr, nullptr);
-
-				if (!ctx->sws_ctx) {
-					printf("sws_getContext failed for client %d\n", ctx->client_id);
+				if (av_frame_get_buffer(ctx->rgb_frame, 32) < 0) {
+					fprintf(stderr, "[Decoder %d] Failed to allocate rgb_frame\n", ctx->client_id);
 					break;
 				}
 
@@ -488,18 +444,21 @@ void decode_thread_func(ClientContext* ctx)
 				ctx->last_height = use_frame->height;
 			}
 
-			sws_scale(ctx->sws_ctx,
-				use_frame->data, use_frame->linesize,
-				0, use_frame->height,
-				ctx->rgb_frame->data, ctx->rgb_frame->linesize);
+			// === GPU-Accelerated NV12 → BGRA ===
+			bool ok = ConvertAVFrameToBGRA(
+				use_frame->data[0], use_frame->linesize[0],  // Y plane + pitch
+				use_frame->data[1], use_frame->linesize[1],  // UV plane + pitch (though pitch not used internally)
+				use_frame->width, use_frame->height,
+				ctx->rgb_frame->data[0], ctx->rgb_frame->linesize[0]  // output BGRA CPU buffer
+			);
 
-			/*if (ctx->frame_queue.size() >= MAX_QUEUE_SIZE) {
-				AVFrame* old = ctx->frame_queue.front();
-				ctx->frame_queue.pop();
-				av_frame_free(&old);
-				printf("[Decoder %d] Frame queue full, dropped oldest frame\n", ctx->client_id);
-			}		*/	
+			if (!ok) {
+				fprintf(stderr, "[Decoder %d] GPU color conversion failed\n", ctx->client_id);
+				break;
+			}
+			
 
+			// === Queue the output frame as before ===
 			AVFrame* queued_frame = av_frame_alloc();
 			if (av_frame_ref(queued_frame, ctx->rgb_frame) < 0) {
 				fprintf(stderr, "[Decoder %d] Failed to copy frame for queue\n", ctx->client_id);
@@ -507,12 +466,15 @@ void decode_thread_func(ClientContext* ctx)
 				break;
 			}
 
-			{
+			send_to_ndi(ctx, ctx->rgb_frame);
+
+
+			/*{
 				std::lock_guard<std::mutex> qlock(ctx->queue_mutex);
 				ctx->frame_queue.push(queued_frame);
 				printf("[Decoder %d] Queue size: %zu\n", ctx->client_id, ctx->frame_queue.size());
 			}
-			ctx->queue_cv.notify_one();
+			ctx->queue_cv.notify_one();*/
 
 			auto t2 = std::chrono::steady_clock::now();
 			std::cout << "Decode time: " << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << "ms\n";
@@ -568,8 +530,8 @@ static void setup(imf::Loop* loop)
 		HWCodecType hwCodecType;
 		std::string ndi_name;
 	} client_inputs[] = {
-		{ "192.168.11.108", DecoderType::HW_CUDA, HWCodecType::H264_CUVID, "Khel_NDI_1" },
-		{ "192.168.11.149", DecoderType::HW_CUDA, HWCodecType::H264_CUVID, "Khel_NDI_2" },
+		{ "192.168.11.108", DecoderType::HW_CUDA, HWCodecType::HEVC_CUVID, "Khel_NDI_1" },
+		{ "192.168.11.149", DecoderType::HW_CUDA, HWCodecType::HEVC_CUVID, "Khel_NDI_2" },
 	};
 
 	const int client_count = sizeof(client_inputs) / sizeof(client_inputs[0]);
@@ -651,11 +613,11 @@ int main(int argc, char ** argv)
 {
 	signal(SIGINT, handle_sigint);
 
-	int ret = DetectZCam();
+	/*int ret = DetectZCam();
 	if (ret < 0) {
 		std::cerr << "Failed to Apply Settings" << std::endl;
 		return ret;
-	}
+	}*/
 
 	std::unique_ptr<imf::ThreadLoop> threadLooper(new imf::ThreadLoop(std::bind(setup, _1)));
 	threadLooper->start();
