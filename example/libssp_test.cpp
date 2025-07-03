@@ -228,7 +228,7 @@ int DetectZCam() {
 	std::cout << "Z CAMs Found: " << found.size() << std::endl;
 	for (int i = 0; i < found.size(); ++i) {
 		ZCamStreamBuilder builder(found[i]);
-		bool success = builder.index("Stream0")			
+		bool success = builder.index("Stream0")
 			.fps(30)
 			.bitrate(10000000)
 			.apply();
@@ -345,7 +345,7 @@ void send_to_ndi(ClientContext* ctx, AVFrame* frame) {
 	ndi_frame.timecode = NDIlib_send_timecode_synthesize;
 	ndi_frame.p_data = frame->data[0];
 	ndi_frame.line_stride_in_bytes = frame->linesize[0];
-	NDIlib_send_send_video_v2(ctx->ndi_sender, &ndi_frame);
+	NDIlib_send_send_video_async_v2(ctx->ndi_sender, &ndi_frame);
 }
 
 void ndi_sender_thread(ClientContext* ctx) {
@@ -613,11 +613,11 @@ int main(int argc, char ** argv)
 {
 	signal(SIGINT, handle_sigint);
 
-	/*int ret = DetectZCam();
+	int ret = DetectZCam();
 	if (ret < 0) {
 		std::cerr << "Failed to Apply Settings" << std::endl;
 		return ret;
-	}*/
+	}
 
 	std::unique_ptr<imf::ThreadLoop> threadLooper(new imf::ThreadLoop(std::bind(setup, _1)));
 	threadLooper->start();
