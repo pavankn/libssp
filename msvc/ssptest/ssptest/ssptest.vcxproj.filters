@@ -18,9 +18,15 @@
     <ClCompile Include="..\..\..\example\libssp_test.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\..\src\Khel\Logger.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\..\include\Khel\nv12_to_bgra.cuh">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\include\Khel\Logger.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
