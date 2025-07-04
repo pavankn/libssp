@@ -29,5 +29,8 @@
     <ClInclude Include="..\..\..\include\Khel\Logger.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\..\include\Khel\mdns_exports.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

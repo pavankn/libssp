@@ -17,6 +17,7 @@
 #include "nv12_to_bgra.cuh"
 #include <spdlog/spdlog.h>
 #include "Logger.h"
+#include "mdns_exports.h"
 
 using namespace std::placeholders;
 using json = nlohmann::json;
@@ -27,7 +28,7 @@ using json = nlohmann::json;
 #pragma comment (lib, "libssp.lib")
 #endif
 #define MAX_QUEUE_SIZE 10
-
+#define MAX_IP_ADDRESSES 16
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -255,7 +256,9 @@ struct ClientContext {
 
 	bool seen_keyframe = false;  // Track if we've seen a keyframe
 
-
+	std::string ip;
+	DecoderType decoder_type;
+	std::string ndi_name;
 
 	std::mutex audio_decoder_mutex;
 
@@ -642,26 +645,33 @@ void decode_video_thread_func(ClientContext* ctx) {
 	}
 }
 
-
+// Define client inputs (IP + decoder type)
+typedef struct {
+	std::string ip;
+	DecoderType decoder_type;
+	HWCodecType hwCodecType;
+	std::string ndi_name;
+} client_inputs;
 
 
 static void setup(imf::Loop* loop)
 {
-	// Define client inputs (IP + decoder type)
-	struct {
-		std::string ip;
-		DecoderType decoder_type;
-		HWCodecType hwCodecType;
-		std::string ndi_name;
-	} client_inputs[] = {
-		{ "192.168.11.108", DecoderType::HW_CUDA, HWCodecType::HEVC_CUVID, "Khel_NDI_1" },
-		{ "192.168.11.149", DecoderType::HW_CUDA, HWCodecType::HEVC_CUVID, "Khel_NDI_2" },
-	};
+	char* results[MAX_IP_ADDRESSES];
+	int client_count = mdns_discover_ips(results, MAX_IP_ADDRESSES);
+	for (int i = 0; i < client_count; ++i) {
+		printf("Pavankn Discovered IP: %s\n", results[i]);
+	}
 
-	const int client_count = sizeof(client_inputs) / sizeof(client_inputs[0]);
+	client_inputs* clientInputs = new client_inputs[client_count];	
 
 	for (int i = 0; i < client_count; ++i) {
-		const auto& input = client_inputs[i];
+
+		clientInputs[i].ip = results[i];
+		clientInputs[i].decoder_type = DecoderType::HW_CUDA;
+		clientInputs[i].hwCodecType = HWCodecType::HEVC_CUVID;
+		clientInputs[i].ndi_name = "Khel_NDI_" + std::to_string(i + 1);
+
+		const auto& input = clientInputs[i];
 
 		// Create ClientContext
 		auto ctx = std::make_unique<ClientContext>();
@@ -669,6 +679,11 @@ static void setup(imf::Loop* loop)
 		ctx->type = input.decoder_type;
 		ctx->name = input.ndi_name;
 		ctx->hwCodecType = input.hwCodecType;
+		ctx->ip = input.ip;
+
+		if(results[i] != nullptr) {
+			free(results[i]);
+		}
 
 		// Initialize decoder
 		if (!init_video_decoder(*ctx)) {
@@ -731,6 +746,7 @@ void cleanup_clients() {
 	for (auto& ctx : g_client_contexts) {
 		ctx->video_running = false;
 		ctx->audio_running = false;
+
 		ctx->audio_packet_queue_cv.notify_all();
 		if (ctx->audio_thread.joinable())
 			ctx->audio_thread.join();
@@ -767,21 +783,14 @@ int main(int argc, char ** argv)
 	init_logger();
 	spdlog::info("App started");
 
-	int ret = DetectZCam();
-	if (ret < 0) {
-		spdlog::error("Failed to Apply Settings");
-		return ret;
-	}
-
 	std::unique_ptr<imf::ThreadLoop> threadLooper(new imf::ThreadLoop(std::bind(setup, _1)));
 	threadLooper->start();
-
 
 	while (running) {
 		std::this_thread::sleep_for(std::chrono::seconds(1));
 	}
 
-	cleanup_clients();
+	cleanup_clients();	
 	threadLooper->stop();
 	return 0;
 }
