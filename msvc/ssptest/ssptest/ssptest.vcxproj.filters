@@ -19,4 +19,7 @@
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\..\include\Khel\nv12_to_bgra.cuh" />
+  </ItemGroup>
 </Project>
